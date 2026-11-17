@@ -1,0 +1,76 @@
+package com.rat.focuslock
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.PowerManager
+import android.app.KeyguardManager
+import androidx.core.app.NotificationCompat
+
+class AlarmReceiver : BroadcastReceiver() {
+
+    override fun onReceive(ctx: Context, intent: Intent) {
+        val kind = intent.getStringExtra("kind") ?: return
+        val name = intent.getStringExtra("name") ?: return
+        val prefs = ctx.getSharedPreferences("focus", Context.MODE_PRIVATE)
+        val block = Schedule.blocks.firstOrNull { it.name == name }
+
+        when (kind) {
+            "start" -> {
+                // New block: reset the emergency flag and photo state
+                prefs.edit().putBoolean("killed_today", false).putString("photo_done_block", "").apply()
+                ctx.startForegroundService(Intent(ctx, WatcherService::class.java))
+            }
+            "end" -> {
+                val needsPhoto = block != null && block.photoTarget.isNotEmpty()
+                val done = prefs.getString("photo_done_block", "") == name
+                val killed = prefs.getBoolean("killed_today", false)
+                if (needsPhoto && !done && !killed) {
+                    prefs.edit().putString("awaiting_photo", name).apply()
+                } else {
+                    prefs.edit().putString("awaiting_photo", "").apply()
+                    ctx.stopService(Intent(ctx, WatcherService::class.java))
+                }
+            }
+            "remind" -> remind(ctx, name, block)
+        }
+        // Re-arm this alarm for tomorrow
+        Scheduler.scheduleAll(ctx)
+    }
+
+    private fun remind(ctx: Context, name: String, block: Block?) {
+        val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val km = ctx.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        val inUse = pm.isInteractive && !km.isKeyguardLocked
+
+        val allowed = block?.allowedApps?.joinToString(", ") { label(it) } ?: "calls only"
+        val text = "$name starts in 15 minutes. Only $allowed will work."
+
+        val nm = ctx.getSystemService(NotificationManager::class.java)
+        // Heads-up (pops on screen) when in use, quiet-ish default otherwise
+        val importance = if (inUse) NotificationManager.IMPORTANCE_HIGH else NotificationManager.IMPORTANCE_DEFAULT
+        val chanId = if (inUse) "remind_popup" else "remind_sound"
+        nm.createNotificationChannel(NotificationChannel(chanId, "Reminders", importance))
+
+        val n = NotificationCompat.Builder(ctx, chanId)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("$name in 15 minutes")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setPriority(if (inUse) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+        nm.notify(name.hashCode(), n)
+    }
+
+    private fun label(pkg: String) = when (pkg) {
+        Pkg.STRAVA -> "Strava"
+        Pkg.SPOTIFY -> "Spotify"
+        Pkg.GPAY -> "GPay"
+        Pkg.YOUTUBE -> "YouTube"
+        else -> pkg
+    }
+}
